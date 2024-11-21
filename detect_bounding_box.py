@@ -2,6 +2,8 @@ import fitz  # PyMuPDF
 import numpy as np
 from typing import Tuple, Optional
 import cv2
+import lorem
+
 
 from PIL import ImageFont
 
@@ -80,110 +82,136 @@ def add_text_to_pdf(pdf_path: str, output_path: str, text: str, location: str, f
     finally:
         doc.close()
 
-
-def detect_bounding_box(pdf_path: str, location: str = "top", page_num: int = 0, threshold: int = 200,
-                        add_text: bool = False) -> Optional[Tuple[float, float, float, float]]:
+def calculate_text_dimensions(text: str, font_size: float) -> Tuple[float, float]:
     """
-    Detect a bounding box based on whitespace at the top or bottom of a PDF document and optionally add text.
+    Calculate the width and height required for the given text and font size.
+
+    Args:
+        text (str): The text to measure.
+        font_size (float): The font size.
+
+    Returns:
+        Tuple[float, float]: Width and height for the text.
+    """
+    char_width = font_size * 0.5  # Approximate width per character
+    text_width = len(text) * char_width
+    text_height = font_size * 1.2  # Adjust height to account for line height
+    return text_width, text_height
+
+
+def detect_bounding_box(
+    pdf_path: str, text: str, location: str = "top", page_num: int = 0,
+    threshold: int = 200, font_size: Optional[float] = None
+) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Detect a bounding box based on whitespace and size it according to the text.
 
     Args:
         pdf_path (str): Path to the PDF file.
+        text (str): Text to consider for bounding box size.
         location (str): Location to detect bounding box ('top' or 'bottom'). Default is 'top'.
         page_num (int): Page number to process (0-based index). Default is 0 (first page).
         threshold (int): Pixel value threshold for considering a pixel as white. Default is 200.
-        add_text (bool): If True, add "PDF Seen" text to the detected bounding box. Default is False.
+        font_size (Optional[float]): Font size for the text. If None, extract from the document.
 
     Returns:
         Optional[Tuple[float, float, float, float]]: Bounding box coordinates (x0, y0, x1, y1) or None if not found.
     """
-    if location not in ["top", "bottom"]:
-        raise ValueError("Location must be either 'top' or 'bottom'")
-
     doc = fitz.open(pdf_path)
-
     try:
         page = doc[page_num]
-        resolution_parameter = 300
-        pix = page.get_pixmap(dpi=resolution_parameter)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        if font_size is None:
+            font_size = get_average_font_size(pdf_path, page_num)
 
-        if img.shape[2] == 1:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        # Detect existing text blocks
+        text_blocks = page.get_text("blocks")
+        if not text_blocks:
+            raise ValueError("No text blocks found on the page.")
 
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        # Find the lowest y1 coordinate of existing text
+        lowest_y1 = 0
+        for block in text_blocks:
+            x0, y0, x1, y1, text2, block_no, block_type = block  # Adjust tuple unpacking
+            print(text2)
+            if text2.strip() and text != "":
+                if y1 > lowest_y1:
+                    lowest_y1 = y1
+        print(lowest_y1)
 
+        # Define bounding box margins
+        margin = 10
+        box_width = page.rect.width - 2 * margin
+
+        # Wrap the text to fit inside the bounding box
+        words = text.split()
+        lines = []
+        current_line = ""
+        max_line_width = 0
+        for word in words:
+            test_line = f"{current_line} {word}".strip()
+            test_width, _ = calculate_text_dimensions(test_line, font_size)
+            if test_width <= box_width:
+                current_line = test_line
+            else:
+                lines.append(current_line)
+                current_line = word
+            max_line_width = max(max_line_width, test_width)
+
+        # Add the last line
+        if current_line:
+            lines.append(current_line)
+
+        # Calculate the total height for the bounding box based on the number of lines
+        box_height = font_size * 1.5 * len(lines)
+
+        # Determine the bounding box position
         if location == "top":
-            # Find the first non-white row from top
-            target_row = np.argmax(np.any(gray < threshold, axis=1))
-            if target_row == 0:
-                print("No top whitespace detected.")
-                return None
-            y0, y1 = 0, target_row / pix.h * page.rect.height
-        else:  # bottom
-            # Find the last non-white row from bottom
-            target_row = pix.h - 1 - np.argmax(np.any(gray[::-1] < threshold, axis=1))
-            if target_row == pix.h - 1:
-                print("No bottom whitespace detected.")
-                return None
-            y0, y1 = target_row / pix.h * page.rect.height, page.rect.height
+            x0, y0 = margin, margin
+        elif location == "bottom":
+            x0, y0 = margin, lowest_y1+margin  # Start from whitespace below the last text
+        else:
+            raise ValueError("Location must be either 'top' or 'bottom'.")
 
-        # Find the leftmost and rightmost non-white pixels in the target row
-        non_white_cols = np.where(gray[target_row] < threshold)[0]
-        left_col = non_white_cols[0]
-        right_col = non_white_cols[-1]
+        x1 = min(x0 + max_line_width, page.rect.width - margin)  # No right padding
+        y1 = y0 + box_height
 
-        # Convert pixel coordinates to PDF coordinates
-        x0 = left_col / pix.w * page.rect.width
-        x1 = right_col / pix.w * page.rect.width
+        # Draw the bounding box
+        rect = fitz.Rect(x0, y0, x1, y1)
+        page.draw_rect(rect, color=(0, 0, 1), width=2)  # Blue border
 
-        if add_text:
-            # Create a copy of the PDF document that we can modify
-            modified_pdf = fitz.open()
-            new_page = modified_pdf.new_page(width=page.rect.width, height=page.rect.height)
+        # Draw the text line by line
+        current_y = y0 + font_size * 1.2  # First line position
+        for line in lines:
+            if current_y > y1:  # Stop if text exceeds bounding box
+                break
+            page.insert_text(
+                fitz.Point(x0, current_y),
+                line,
+                fontsize=font_size,
+                color=(1, 0, 0)  # Red text
+            )
+            current_y += font_size * 1.5  # Move to the next line
 
-            # Copy the content of the original page to the new page
-            new_page.show_pdf_page(new_page.rect, doc, page_num)
-
-            # Get the average font size from the document
-            avg_font_size = get_average_font_size(pdf_path, page_num)
-
-            # Add "PDF Seen" text to the detected bounding box
-            text_rect = fitz.Rect(x0, y0, x1, y1)
-            text_color = (1, 0, 0)  # Red color
-            text = "PDF Seen"
-
-            # Use the average font size, but ensure it fits within the box
-            box_width = x1 - x0
-            box_height = y1 - y0
-            # Scale down the font size if it's too large for the box
-            font_size = min(avg_font_size, box_width / len(text) * 1.5, box_height * 0.8)
-
-            # Center the text
-            text_width, text_height = fitz.get_text_length(text, fontname="helv", fontsize=font_size), font_size
-            text_x = x0 + (box_width - text_width) / 2
-            text_y = y0 + (box_height - text_height) / 2 + text_height * 0.8  # Adjust for baseline
-
-            new_page.insert_text((text_x, text_y), text, fontsize=font_size, color=text_color)
-
-            # Save the modified PDF
-            modified_pdf.save('modified_document.pdf')
-            modified_pdf.close()
-
+        # Save the updated PDF
+        doc.save("modified_document.pdf")
         return (x0, y0, x1, y1)
 
     finally:
         doc.close()
 
 
-
 if __name__ == "__main__":
     # Example usage
-    pdf_path = "PDF/test.pdf"
+    pdf_path = "PDF/invoice.pdf"
     # top_box = detect_bounding_box(pdf_path, location="top", add_text=True)
     # if top_box:
     #     print(f"Detected top bounding box: {top_box}")
-
+    paragraph = lorem.paragraph() + "\n" + lorem.paragraph() + "\n" + lorem.paragraph()
+    # text = "This is dynamically placed text"
     # Detect bottom bounding box
-    bottom_box = detect_bounding_box(pdf_path, location="bottom", add_text=True)
+    location = "top"
+    font_size = get_average_font_size(pdf_path)
+
+    bottom_box = detect_bounding_box(pdf_path, paragraph, location)
     if bottom_box:
         print(f"Detected bottom bounding box: {bottom_box}")
