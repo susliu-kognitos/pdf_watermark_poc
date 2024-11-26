@@ -202,7 +202,7 @@ def detect_bounding_box(
 
 if __name__ == "__main__":
     # Example usage
-    pdf_path = "PDF/invoice.pdf"
+    pdf_path = "PDF/test.pdf"
     # top_box = detect_bounding_box(pdf_path, location="top", add_text=True)
     # if top_box:
     #     print(f"Detected top bounding box: {top_box}")
